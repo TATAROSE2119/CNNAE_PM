@@ -1,5 +1,6 @@
 from tep_data_load import *
 from prepare_windows_for_cnn import *
+from CNNAE import *
 
 if __name__ == "__main__":
     # 测试数据加载功能,查看输出形状,加载数据
@@ -10,3 +11,13 @@ if __name__ == "__main__":
     for xb in train_loader:
         print("一个批次的形状：", xb[0].shape)  # xb 是一个元组，包含输入张量
         break
+
+    P=X.shape[1]
+    print("变量数 P =", P)
+    xb=next(iter(train_loader))
+    #print("输入张量形状：", xb.shape)  # xb 是一个元组，包含输入张量
+
+    model = CNNAE(in_ch=P, latent_ch=32)
+    model,hist=fit_cnn_ae(model,train_loader,val_loader,epochs=50,lr=1e-3,patience=8)
+
+

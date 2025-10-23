@@ -28,6 +28,7 @@ def check_torch_gpu():
     device_count = torch.cuda.device_count()
     print(f"🖥️ 检测到 GPU 数量：{device_count}")
     for i in range(device_count):
+        #打印gpu信息
         print(f"  [{i}] {torch.cuda.get_device_name(i)}")
         print(f"     当前显存占用：{torch.cuda.memory_allocated(i) / 1024 ** 2:.2f} MB")
         print(f"     可用显存：{torch.cuda.get_device_properties(i).total_memory / 1024 ** 3:.2f} GB")
