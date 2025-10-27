@@ -10,6 +10,7 @@ from compute_cl_and_spe import *
 from compute_test_spe import *
 from expand_spe_to_time_series import  *
 from compute_metrics_window import *
+from compute_window_time_errors import *
 
 import matplotlib.pyplot as plt
 
@@ -99,3 +100,27 @@ if __name__ == "__main__":
         plt.savefig(outpath, dpi=150)
         plt.close()
         print(f"保存图像: {outpath}")
+
+        # 方案 B：逐时间步误差重叠平均
+        E_win, Nw, Lw = compute_window_time_errors(model, eval_loader)
+        print("E_win shape =", E_win.shape)  # 期望: (len(starts), L)
+        T = 600
+        spe_ts, cnt_ts = overlap_average_to_timeseries(E_win, starts, T)
+        print("spe_ts shape =", spe_ts.shape, " min(cnt)=", cnt_ts.min(), " max(cnt)=", cnt_ts.max())
+        metrics_ts = compute_metrics_timestep(t_fault_start=200, spe_ts=spe_ts, CL=CL)
+        print("[逐时刻] 报警数:", metrics_ts["num_alarm_ts"])
+        print("[逐时刻] 首次报警时间:", metrics_ts["first_alarm_time_ts"])
+        print("[逐时刻] 检测延迟:", metrics_ts["delay_ts"])
+        print("[逐时刻] FAR:", metrics_ts["FAR_ts"], "TPR:", metrics_ts["TPR_ts"])
+        plt.figure(figsize=(11, 4))
+        plt.plot(np.arange(T), spe_ts, label='SPE (per-time, overlap-avg)', linewidth=1.3)
+        plt.axhline(CL, color='r', linestyle='--', linewidth=2, label='Control Limit (window-based)')
+        plt.axvline(200, color='k', linestyle=':', label='Fault Start')
+        plt.scatter(np.where(metrics_ts["alarm_ts"])[0], spe_ts[metrics_ts["alarm_ts"]],
+                    s=12, marker='o', label='Alarm (ts)', zorder=3)
+        plt.xlabel('Time index')
+        plt.ylabel('SPE (per-time)')
+        plt.title('CNN-AE Monitoring — Per-Time Overlap Averaged')
+        plt.legend()
+        plt.tight_layout()
+        plt.show()
