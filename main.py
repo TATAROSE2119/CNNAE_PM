@@ -20,6 +20,10 @@ if __name__ == "__main__":
     # 测试数据加载功能,查看输出形状,加载数据
     X=tep_data_load('TE_data/M1/m1d00.mat','m1d00')
     # 保留X的1~600个样本
+    X=X[:2000,:]
+    print("用于训练的样本数：", X.shape[0])
+
+    train_epoch=200
 
 
     # 把连续时序 X 规范化并切成固定长度的滑动窗口，再整理成 CNN 需要的张量形状。
@@ -35,7 +39,27 @@ if __name__ == "__main__":
     #print("输入张量形状：", xb.shape)  # xb 是一个元组，包含输入张量
 
     model = CNNAE(in_ch=P, latent_ch=32)
-    model,hist=fit_cnn_ae(model,train_loader,val_loader,epochs=50,lr=1e-3,patience=8)
+    model,hist=fit_cnn_ae(model,train_loader,val_loader,epochs=train_epoch,lr=1e-3,patience=8)
+    # 将历史拆分为数组
+    train_curve = np.array([h[0] for h in hist], dtype=float)
+    val_curve = np.array([h[1] for h in hist], dtype=float)
+    epochs_axis = np.arange(1, len(hist) + 1)
+
+    plt.figure(figsize=(8, 4))
+    plt.plot(epochs_axis, train_curve, label='train_mse', linewidth=1.8)
+    plt.plot(epochs_axis, val_curve, label='val_mse', linewidth=1.8)
+    plt.xlabel('Epoch')
+    plt.ylabel('MSE')
+    plt.title('Training & Validation MSE')
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig('loss_curve.png', dpi=150)
+    plt.show()
+
+    print("学习曲线已保存：loss_curve.png")
+
+
+
 
     CL,spe_train=compute_cl_and_spe(model,train_loader)
     print("训练集 SPE 控制限 CL =", CL)

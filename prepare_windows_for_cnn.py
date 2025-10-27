@@ -36,17 +36,20 @@ def prepare_windows_for_cnn(X:np.array,L:int=10,hop:int=10,batch_size:int=64,val
     X_cnn=torch.tensor(X_windows).permute(0,2,1).contiguous() # tensor().permute()改变维度顺序，contiguous()确保内存连续性
 
     # (4) 划分训练/验证集，无监督重构任务，输入等于输出
-    N=X_cnn.size(0)#获取样本数量
-    n_val=int(N*val_ratio)#计算验证集样本数
-    n_train=N-n_val#计算训练集样本数
-    perm = torch.randperm(n_train) #生成随机排列索引
-    train_idx = perm[:n_train] #训练集索引
-    val_idx = perm[n_train:]   #验证集索引
+    N = X_cnn.size(0)
+    n_train = int(N * (1.0 - val_ratio))
+    train_idx = torch.arange(0, n_train)  # 按时间前段
+    val_idx = torch.arange(n_train, N)  # 按时间后段
 
-    X_train = X_cnn[train_idx]#训练集数据
-    X_val = X_cnn[val_idx]#验证集数据
+    X_train = X_cnn[train_idx]
+    X_val = X_cnn[val_idx]
 
-    train_loader = DataLoader(TensorDataset(X_train), batch_size=batch_size, shuffle=True)#训练数据加载器
-    val_loader = DataLoader(TensorDataset(X_val), batch_size=batch_size, shuffle=False)#验证数据加载器
-
+    train_loader = DataLoader(
+        TensorDataset(X_train, X_train),
+        batch_size=batch_size, shuffle=True, drop_last=True
+    )
+    val_loader = DataLoader(
+        TensorDataset(X_val, X_val),
+        batch_size=batch_size, shuffle=False, drop_last=False  # 验证：不打乱、不丢尾
+    )
     return train_loader, val_loader,(mean.astype(np.float32)),(std.astype(np.float32))#返回训练/验证数据加载器及标准化参数
