@@ -1,15 +1,15 @@
 import os
 
 import numpy as np
-from dask.array import vstack, append
+
+import torch
+from torch.utils.data import DataLoader, TensorDataset
 
 from tep_data_load import *
 from prepare_windows_for_cnn import *
 from CNNAE import *
 from compute_cl_and_spe import *
-from compute_test_spe import *
-from expand_spe_to_time_series import  *
-from compute_metrics_window import *
+
 from compute_window_time_errors import *
 
 import matplotlib.pyplot as plt
@@ -74,53 +74,27 @@ if __name__ == "__main__":
         X_cnn = torch.tensor(X_win).permute(0, 2, 1).contiguous()
         eval_loader = DataLoader(TensorDataset(X_cnn, X_cnn), batch_size=256, shuffle=False)
 
-        # 推理并计算窗口级 SPE
-        spe_test = compute_spe(model, eval_loader)
-        t_points = starts + (L - 1)
-
-        # 展开为时间序列并计算指标
-        spe_full_step, cl_full_step = expand_spe_to_time_series(spe_test, t_points, T, mode='step', cl=CL)
-        metrics = compute_metrics_window(t_points, spe_test, CL, t_fault_start)
-
-        print(
-            f"[{name}] 报警数: {metrics['num_alarms']}, 首次报警: {metrics['first_alarm_time']}, 延迟: {metrics['delay']}, FAR: {metrics['FAR']:.4f}, TPR: {metrics['TPR']:.4f}")
-
-        # 可视化并保存
-        plt.figure(figsize=(10, 4))
-        plt.plot(np.arange(T), spe_full_step, label='SPE (expanded, step)', linewidth=1.2)
-        if cl_full_step is not None:
-            plt.plot(np.arange(T), cl_full_step, 'r--', linewidth=2, label='Control Limit')
-        plt.axvline(t_fault_start, color='k', linestyle=':', label='Fault Start')
-        plt.xlabel('Time index')
-        plt.ylabel('SPE')
-        plt.title(f'CNN-AE Monitoring - {name}')
-        plt.legend()
-        plt.tight_layout()
-        outpath = os.path.join('results', f'{name}_spe.png')
-        plt.savefig(outpath, dpi=150)
-        plt.close()
-        print(f"保存图像: {outpath}")
 
         # 方案 B：逐时间步误差重叠平均
         E_win, Nw, Lw = compute_window_time_errors(model, eval_loader)
         print("E_win shape =", E_win.shape)  # 期望: (len(starts), L)
-        T = 600
         spe_ts, cnt_ts = overlap_average_to_timeseries(E_win, starts, T)
         print("spe_ts shape =", spe_ts.shape, " min(cnt)=", cnt_ts.min(), " max(cnt)=", cnt_ts.max())
-        metrics_ts = compute_metrics_timestep(t_fault_start=200, spe_ts=spe_ts, CL=CL)
+        metrics_ts = compute_metrics_timestep(t_fault_start=t_fault_start, spe_ts=spe_ts, CL=CL)
         print("[逐时刻] 报警数:", metrics_ts["num_alarm_ts"])
         print("[逐时刻] 首次报警时间:", metrics_ts["first_alarm_time_ts"])
         print("[逐时刻] 检测延迟:", metrics_ts["delay_ts"])
         print("[逐时刻] FAR:", metrics_ts["FAR_ts"], "TPR:", metrics_ts["TPR_ts"])
         plt.figure(figsize=(11, 4))
         plt.plot(np.arange(T), spe_ts, label='SPE (per-time, overlap-avg)', linewidth=1.3)
-        plt.axhline(CL, color='r', linestyle='--', linewidth=2, label='Control Limit (window-based)')
-        plt.axvline(200, color='k', linestyle=':', label='Fault Start')
-        plt.scatter(np.where(metrics_ts["alarm_ts"])[0], spe_ts[metrics_ts["alarm_ts"]],
-                    s=12, marker='o', label='Alarm (ts)', zorder=3)
+        plt.axhline(CL, color='r', linestyle='--', linewidth=2, label='Control Limit')
+        plt.axvline(t_fault_start, color='k', linestyle=':', label='Fault Start')
+        alarm_idx = np.where(metrics_ts["alarm_ts"])[0]
+        if alarm_idx.size > 0:
+            plt.scatter(alarm_idx, spe_ts[alarm_idx], s=12, marker='o', label='Alarm (ts)', zorder=3)
         plt.xlabel('Time index')
         plt.ylabel('SPE (per-time)')
-        plt.title('CNN-AE Monitoring — Per-Time Overlap Averaged')
+        plt.title(f'CNN-AE Monitoring — {name} (Overlap Avg)')
         plt.legend()
         plt.tight_layout()
         plt.show()
