@@ -1,6 +1,19 @@
 import numpy as np
 import torch
 
+
+def _extract_x(batch):
+    """Helper to pull input tensors from different batch structures."""
+    if isinstance(batch, dict):
+        xb = batch.get('x') or batch.get('input') or batch.get('data')
+        if xb is None:
+            return batch
+        return xb
+    if isinstance(batch, (list, tuple)):
+        return batch[0]
+    return batch
+
+
 def compute_metrics_timestep(t_fault_start, spe_ts, CL):
     """
     基于逐时刻误差 spe_ts 与常数 CL 的指标（可视化口径）。
@@ -77,8 +90,8 @@ def compute_window_time_errors(model, loader):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     model.to(device).eval()
     chunks = []
-    for xb, _ in loader:
-        xb = xb.to(device)
+    for batch in loader:
+        xb = _extract_x(batch).to(device)
         xhat, _ = model(xb)
         # 对“通道维”求均方误差，保留时间维：得到 [batch, L]
         # (xb - xhat)^2: [N, P, L]  -> mean(dim=1) -> [N, L]
