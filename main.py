@@ -18,7 +18,7 @@ import matplotlib.pyplot as plt
 
 if __name__ == "__main__":
     # 测试数据加载功能,查看输出形状,加载数据
-    X=tep_data_load('TE_data/M1/m1d00.mat','m1d00')
+    X=tep_data_load('TE_data/M2/m2d00.mat','m2d00')
     # 保留X的1~600个样本
     X=X[:2000,:]
     print("用于训练的样本数：", X.shape[0])
@@ -66,23 +66,23 @@ if __name__ == "__main__":
 
     # 加载测试数据集
     # 1️⃣ 拼接：前200个正常 + 前400个故障
-    X_fault_in_normal=tep_data_load('TE_data/M1/m1d00.mat','m1d00')
+    X_fault_in_normal=tep_data_load('TE_data/M2/m2d00.mat','m2d00')
     os.makedirs('results', exist_ok=True)
 
     fault_ids = range(1, 22)  # m1d01 .. m1d21
     t_fault_start = 200
     L, hop = 100, 10
-    T = 600
+    T = 1000
 
     for idx in fault_ids:
-        name = f"m1d{idx:02d}"
-        path = os.path.join('TE_data', 'M1', f"{name}.mat")
+        name = f"m2d{idx:02d}"
+        path = os.path.join('TE_data', 'M2', f"{name}.mat")
         print(f"处理故障样本: {name}  文件: {path}")
 
         # 加载故障数据
         X_fault = tep_data_load(path, name)
         # 拼接：前200个正常 + 前400个故障（与原逻辑一致）
-        X_fault_seq = np.vstack([X_fault_in_normal[:200, :], X_fault[:400, :]])
+        X_fault_seq = np.vstack([X_fault_in_normal[:200, :], X_fault[:800, :]])
         print(f"拼接后数据形状: {X_fault_seq.shape}")
 
         # 标准化（用训练阶段的 mean/std）
