@@ -8,6 +8,7 @@ def tep_data_load(mat_path,var_name,):
     #筛选data中的变量
     cols_to_delete = [45, 49] + list(range(52, X.shape[1]))
     X_new = np.delete(X, cols_to_delete, axis=1)
+    X_new= X_new[:2000,:]
     print("删除后形状：", X_new.shape)
 
     return X_new
