@@ -28,6 +28,22 @@ from train_session import train_one_session
 # -------------------------
 # 基础设置
 # -------------------------
+MODE_STATS = {}  # e.g., {'M1': (mean1, std1), 'M2': (mean2, std2), ...}
+    # 已学到哪些工况就评哪些工况（逐会话递增）
+NORMALS = [
+    ('TE_data/M1/m1d00.mat', 'm1d00'),
+    ('TE_data/M2/m2d00.mat', 'm2d00'),
+    ('TE_data/M3/m3d00.mat', 'm3d00'),
+    ('TE_data/M4/m4d00.mat', 'm4d00'),
+]
+FAULTS = [
+    ('TE_data/M1/m1d04.mat', 'm1d04'),
+    ('TE_data/M2/m2d04.mat', 'm2d04'),
+    ('TE_data/M3/m3d04.mat', 'm3d04'),
+    ('TE_data/M4/m4d04.mat', 'm4d04'),
+]
+
+
 SEED = 0
 random.seed(SEED); np.random.seed(SEED); torch.manual_seed(SEED)
 if torch.cuda.is_available():
@@ -223,49 +239,121 @@ def plot_monitor(spe_ts, CL, segs, title, out_png):
     plt.legend(); plt.tight_layout(); plt.savefig(out_png, dpi=150); plt.close()
 
 # 6) 一键评估：每个会话结束后调用
-def eval_after_session(session_id, combo_model, mean, std, learned_normal_paths, learned_fault_paths,
-                       L=100, hop=10, device=None, alpha=0.995):
+def eval_after_session(session_id, combo_model, learned_modes,   # e.g. ['M1'] 或 ['M1','M2',...]
+                       normals, faults,                          # [(path,varname), ...] 与 learned_modes 对齐
+                       L=100, hop=10, alpha=0.995, device=None):
     """
-    learned_normal_paths / learned_fault_paths: 只放“到当前会话为止”的工况顺序子集。
-      例如 Session-1 用 [(M1_norm)], [(M1_fault)]
-           Session-2 用 [(M1_norm,M2_norm)], [(M1_fault,M2_fault)] 以此类推
+    learned_modes: 到当前会话为止已学习的工况列表，例如 ['M1'] 或 ['M1','M2']
+    normals/faults: 与 learned_modes 一一对应的 (path,var) 列表
     """
-    # ① 构造多工况测试序列（200 正常 + 800 故障）× 已学工况
-    X_test, segs = build_multi_mode_sequence(learned_normal_paths, learned_fault_paths, mean, std, L, hop)
-    # ② 逐时间步 SPE（方案B）
-    X_cnn, starts, T = make_windows(X_test, mean, std, L, hop)
-    E_win = window_time_errors(combo_model, X_cnn, device=device)
-    spe_ts, cnt = overlap_avg(E_win, starts, T)
-    # ③ 全局 CL（逐时间步口径，基于“已学工况”的正常数据集合）
-    learned_normals = []
-    for (pn, vn) in learned_normal_paths:
-        from tep_data_load import tep_data_load
-        learned_normals.append(tep_data_load(pn, vn))
-    CL = compute_global_CL_per_time(combo_model, learned_normals, mean, std, L, hop, alpha=alpha, device=device)
-    # ④ 指标
-    m = metrics_per_time(spe_ts, CL, segs)
-    # ⑤ 画图
-    plot_monitor(spe_ts, CL, segs, f'Session-{session_id} Monitoring (Per-time)', f'artifacts/monitor_S{session_id}.png')
-    return CL, m, spe_ts, segs
+    import numpy as np
+    from tep_data_load import tep_data_load
+    if device is None: device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    combo_model = combo_model.to(device).eval()
 
+    # ---- 工具：分段滑窗（按该工况自己的 mean/std），不跨段
+    def _make_seg_windows(X, mean, std, L, hop):
+        Xn = (X - mean) / (std + 1e-8)
+        starts = np.arange(0, Xn.shape[0]-L+1, hop, dtype=int)
+        Xw = np.empty((len(starts), L, Xn.shape[1]), dtype=np.float32)
+        for i,s in enumerate(starts): Xw[i] = Xn[s:s+L,:]
+        X_cnn = torch.tensor(Xw).permute(0,2,1).contiguous()
+        return X_cnn, starts, Xn.shape[0]
+
+    @torch.no_grad()
+    def _win_err(model, X_cnn):
+        ld = DataLoader(TensorDataset(X_cnn, X_cnn), batch_size=256, shuffle=False, drop_last=False)
+        arr = []
+        for xb,_ in ld:
+            xb = xb.to(device)
+            xhat,_ = model(xb)
+            e = ((xb-xhat)**2).mean(dim=1).detach().cpu().numpy()
+            arr.append(e)
+        return np.concatenate(arr, axis=0)  # [Nw,L]
+
+    def _overlap(E, starts, T):
+        Nw,L = E.shape
+        ssum = np.zeros(T, dtype=np.float64)
+        cnt  = np.zeros(T, dtype=np.int32)
+        for i,s in enumerate(starts):
+            ssum[s:s+L] += E[i]; cnt[s:s+L] += 1
+        spe = np.full(T, np.nan, dtype=np.float64)
+        m = cnt>0; spe[m] = ssum[m]/cnt[m]
+        return spe, cnt
+
+    # ---- 1) 构造“200正常+800故障” × 每个已学工况，并分段计算窗口误差
+    E_list, S_list = [], []
+    segs, offset = [], 0
+    T_total = 0
+    for mode, (p_norm,v_norm), (p_fault,v_fault) in zip(learned_modes, normals, faults):
+        mean, std = MODE_STATS[mode]
+        Xn = tep_data_load(p_norm, v_norm)[:200,:]
+        Xf = tep_data_load(p_fault, v_fault)[:800,:]
+        Xseg = np.vstack([Xn, Xf])
+
+        X_cnn, starts, T = _make_seg_windows(Xseg, mean, std, L, hop)
+        Ew = _win_err(combo_model, X_cnn)
+
+        E_list.append(Ew)
+        S_list.append(starts + offset)                # 映射到全局时间
+        segs.append((offset, offset+len(Xn)-1,        # (norm_start, norm_end,
+                     offset+len(Xn), offset+len(Xn)+len(Xf)-1))  # fault_start, fault_end)
+        offset += T
+        T_total += T
+
+    E_all = np.vstack(E_list)
+    S_all = np.concatenate(S_list)
+    spe_ts, cnt = _overlap(E_all, S_all, T_total)
+
+    # ---- 2) 逐时间步全局 CL：用已学工况的“正常全段”，各自用自家 mean/std
+    all_spe = []
+    for mode, (p_norm,v_norm) in zip(learned_modes, normals):
+        mean, std = MODE_STATS[mode]
+        Xn_full = tep_data_load(p_norm, v_norm)
+        X_cnn, starts, T = _make_seg_windows(Xn_full, mean, std, L, hop)
+        Ew = _win_err(combo_model, X_cnn)
+        spe_norm, _ = _overlap(Ew, starts, T)
+        all_spe.append(spe_norm[L-1:])   # 避开左边界
+    CL = float(np.nanquantile(np.concatenate(all_spe), alpha))
+
+    # ---- 3) 指标
+    alarm = spe_ts > CL
+    pre_mask = np.zeros(T_total, dtype=bool)
+    post_mask= np.zeros(T_total, dtype=bool)
+    first_alarm = None
+    for (ns,ne,fs,fe) in segs:
+        pre_mask[ns:ne+1]  = True
+        post_mask[fs:fe+1] = True
+        idx = np.where(alarm[fs:fe+1])[0]
+        if first_alarm is None and idx.size>0:
+            first_alarm = fs + int(idx[0])
+    FAR = float((alarm & pre_mask).sum()) / max(1, pre_mask.sum())
+    TPR = float((alarm & post_mask).sum()) / max(1, post_mask.sum())
+
+    # ---- 4) 画图
+    xs = np.arange(T_total)
+    plt.figure(figsize=(11,4))
+    plt.plot(xs, spe_ts, label='SPE (per-time)', linewidth=1.2)
+    plt.axhline(CL, linestyle='--', label='Global CL (per-time)')
+    ymax = np.nanpercentile(spe_ts, 99.5) * 1.1 if np.isfinite(spe_ts).all() else np.nanmax(spe_ts)*1.1
+    for k,(ns,ne,fs,fe) in enumerate(segs, start=1):
+        plt.axvline(ns, color='k', linestyle=':', alpha=0.4)
+        plt.axvline(fs, color='r', linestyle=':', alpha=0.5)
+        plt.text((ns+ne)//2, ymax*0.05, f'M{k}-Norm', ha='center', va='bottom', fontsize=8)
+        plt.text((fs+fe)//2, ymax*0.10, f'M{k}-Fault',ha='center', va='bottom', fontsize=8)
+    plt.title(f'Session-{session_id} Monitoring (Per-time)')
+    plt.xlabel('Time'); plt.ylabel('SPE (per-time)')
+    plt.legend(); plt.tight_layout()
+    plt.savefig(f'artifacts/monitor_S{session_id}.png', dpi=150)
+    plt.close()
+
+    metrics = dict(FAR=FAR, TPR=TPR, first_alarm=first_alarm)
+    return CL, metrics, spe_ts, segs
 
 
 
 def main():
-    MODE_STATS = {}  # e.g., {'M1': (mean1, std1), 'M2': (mean2, std2), ...}
-    # 已学到哪些工况就评哪些工况（逐会话递增）
-    NORMALS = [
-        ('TE_data/M1/m1d00.mat', 'm1d00'),
-        ('TE_data/M2/m2d00.mat', 'm2d00'),
-        ('TE_data/M3/m3d00.mat', 'm3d00'),
-        ('TE_data/M4/m4d00.mat', 'm4d00'),
-    ]
-    FAULTS = [
-        ('TE_data/M1/m1d04.mat', 'm1d04'),
-        ('TE_data/M2/m2d04.mat', 'm2d04'),
-        ('TE_data/M3/m3d04.mat', 'm3d04'),
-        ('TE_data/M4/m4d04.mat', 'm4d04'),
-    ]
+
     os.makedirs('artifacts', exist_ok=True)
 
     # =======================
@@ -276,9 +364,10 @@ def main():
     print("M1 原始形状：", X_M1.shape)
 
     # 2) 窗口化（按时间切分 val）
-    train_loader_M1, val_loader_M1, (mean, std) = prep_windows_compat(
+    train_loader_M1, val_loader_M1, (mean1, std1) = prep_windows_compat(
         X_M1, L=L, hop=HOP, batch_size=BATCH, val_ratio=VAL_RATIO
     )
+    MODE_STATS['M1'] = (mean1, std1)
 
     # 3) 定义共享编码器与解码器
     #    复用你原来的 CNNAE 解码器；backbone 作为共享特征提取器
@@ -320,15 +409,14 @@ def main():
     mem.add('M1', xs=xb_M1.cpu(), ys=None, k=MEM_PER_ADD)
 
     # === 会话1结束后（只评 M1）===
-    CL_S1, metrics_S1, spe_ts_S1, segs_S1 = eval_after_session(
-        session_id=1,
-        combo_model=combo_model,
-        mean=mean, std=std,
-        learned_normal_paths=NORMALS[:1],
-        learned_fault_paths=FAULTS[:1],
-        L=L, hop=HOP, device=DEVICE, alpha=0.995
+    combo_model = CombinedAE(backbone, decoder)
+    CL1, m1, _, _ = eval_after_session(
+        session_id=1, combo_model=combo_model,
+        learned_modes=['M1'],
+        normals=NORMALS[:1], faults=FAULTS[:1],
+        L=L, hop=HOP, alpha=0.995, device=DEVICE
     )
-    print("S1 Global-CL:", CL_S1, "Metrics:", metrics_S1)
+    print('S1:', m1, 'CL=', CL1)
 
     # =======================
     # 会话 2：M2
@@ -339,9 +427,10 @@ def main():
         X_M2 = tep_data_load('TE_data/M2/m2d00.mat', 'm2d00')
         print("M2 原始形状：", X_M2.shape)
 
-        train_loader_M2, val_loader_M2, _ = prep_windows_compat(
+        train_loader_M2, val_loader_M2, (mean2, std2) = prep_windows_compat(
             X_M2, L=L, hop=HOP, batch_size=BATCH, val_ratio=VAL_RATIO
         )
+        MODE_STATS['M2'] = (mean2, std2)
 
         # 2) 持续学习：用上会话 teacher + 记忆库，更新同一个 backbone/decoder
         teacher, hist_M2 = train_one_session(
@@ -369,15 +458,14 @@ def main():
         xb_M2, _ = next(iter(train_loader_M2))
         mem.add('M2', xs=xb_M2.cpu(), ys=None, k=MEM_PER_ADD)
         # === 会话2结束后（评 M1+M2）===
-        CL_S2, metrics_S2, spe_ts_S2, segs_S2 = eval_after_session(
-            session_id=2,
-            combo_model=combo_model,
-            mean=mean, std=std,
-            learned_normal_paths=NORMALS[:2],
-            learned_fault_paths=FAULTS[:2],
-            L=L, hop=HOP, device=DEVICE, alpha=0.995
+        CL2, m2, _, _ = eval_after_session(
+            session_id=2, combo_model=combo_model,
+            learned_modes=['M1', 'M2'],
+            normals=NORMALS[:2], faults=FAULTS[:2],
+            L=L, hop=HOP, alpha=0.995, device=DEVICE
         )
-        print("S2 Global-CL:", CL_S2, "Metrics:", metrics_S2)
+        print('S2:', m2, 'CL=', CL2)
+
 
 
 
@@ -386,23 +474,41 @@ def main():
         CL_M2 = None
 
     # =======================
-    # 保存工件
+    # 保存工件（Artifacts）
     # =======================
-    # 模型
+    os.makedirs('artifacts', exist_ok=True)
+
+    # 1️⃣ 模型参数（共享 CNN 编码器 + 解码器）
     torch.save(backbone.state_dict(), 'artifacts/backbone.pt')
-    torch.save(decoder.state_dict(),  'artifacts/decoder.pt')
+    torch.save(decoder.state_dict(), 'artifacts/decoder.pt')
 
-    # 阈值与标准化参数
-    cl_dict = {'M1': float(CL_M1)}
-    if CL_M2 is not None:
-        cl_dict['M2'] = float(CL_M2)
+    # 2️⃣ 每个工况的 CL（控制限）
+    # 例如：CL_dict = {'M1': CL_M1, 'M2': CL_M2, ...}
+    CL_dict = {}
+    if 'CL_M1' in locals(): CL_dict['M1'] = float(CL_M1)
+    if 'CL_M2' in locals(): CL_dict['M2'] = float(CL_M2)
+    if 'CL_M3' in locals(): CL_dict['M3'] = float(CL_M3)
+    if 'CL_M4' in locals(): CL_dict['M4'] = float(CL_M4)
+
     with open('artifacts/cls.json', 'w', encoding='utf-8') as f:
-        json.dump(cl_dict, f, indent=2, ensure_ascii=False)
+        json.dump(CL_dict, f, indent=2, ensure_ascii=False)
 
-    np.savez('artifacts/standardize_params.npz', mean=mean, std=std)
+    # 3️⃣ 每个工况的标准化参数
+    # MODE_STATS 是全局字典：{'M1': (mean1,std1), 'M2': (mean2,std2), ...}
+    npz_dict = {}
+    for mode, (mean_val, std_val) in MODE_STATS.items():
+        npz_dict[f'{mode}_mean'] = mean_val
+        npz_dict[f'{mode}_std'] = std_val
 
-    print("Artifacts saved in ./artifacts")
-    print("Done.")
+    np.savez('artifacts/standardize_params.npz', **npz_dict)
+
+    # 4️⃣ 记录会话索引（当前已经学到第几工况）
+    meta = {'learned_modes': list(MODE_STATS.keys())}
+    with open('artifacts/meta.json', 'w', encoding='utf-8') as f:
+        json.dump(meta, f, indent=2, ensure_ascii=False)
+
+    print("\n✅ Artifacts saved in ./artifacts")
+    print("   包含: backbone.pt, decoder.pt, cls.json, standardize_params.npz, meta.json")
 
 
 if __name__ == "__main__":
