@@ -106,7 +106,166 @@ def prep_windows_compat(X, L, hop, batch_size, val_ratio):
         raise RuntimeError(f"prepare_windows_for_cnn 返回未知签名：len={len(out)}")
     return train_loader, val_loader, (mean, std)
 
+# ====== 逐时间步 SPE（方案B）与多工况评估 ======
+import numpy as np
+import torch
+from torch.utils.data import TensorDataset, DataLoader
+import matplotlib.pyplot as plt
+
+# 1) 滑窗 -> E_win -> 重叠平均为逐时刻
+def make_windows(X, mean, std, L=100, hop=10):
+    Xn = (X - mean) / (std + 1e-8)
+    starts = np.arange(0, Xn.shape[0]-L+1, hop, dtype=int)
+    X_win = np.empty((len(starts), L, Xn.shape[1]), dtype=np.float32)
+    for i,s in enumerate(starts): X_win[i] = Xn[s:s+L,:]
+    X_cnn = torch.tensor(X_win).permute(0,2,1).contiguous()  # [N,P,L]
+    return X_cnn, starts, Xn.shape[0]
+
+@torch.no_grad()
+def window_time_errors(model, X_cnn, batch=256, device=None):
+    if device is None: device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    model = model.to(device).eval()
+    loader = DataLoader(TensorDataset(X_cnn, X_cnn), batch_size=batch, shuffle=False, drop_last=False)
+    chunks = []
+    for xb,_ in loader:
+        xb = xb.to(device)
+        xhat,_ = model(xb)
+        # 对通道均方，保留时间维 -> [B,L]
+        e = ((xb - xhat)**2).mean(dim=1).detach().cpu().numpy()
+        chunks.append(e)
+    E_win = np.concatenate(chunks, axis=0)  # [Nw,L]
+    return E_win
+
+def overlap_avg(E_win, starts, T):
+    Nw,L = E_win.shape
+    ssum = np.zeros(T, dtype=np.float64)
+    cnt  = np.zeros(T, dtype=np.int32)
+    for i,s in enumerate(starts):
+        ssum[s:s+L] += E_win[i]
+        cnt[s:s+L]  += 1
+    spe_ts = np.full(T, np.nan, dtype=np.float64)
+    m = cnt>0; spe_ts[m] = ssum[m]/cnt[m]
+    return spe_ts, cnt
+
+# 2) 构造“多工况拼接测试序列”
+#   形如：mode1norm(200) : mode1fault(800) : mode2norm(200) : mode2fault(800) : ...
+def build_multi_mode_sequence(norm_paths, fault_paths, mean, std, L=100, hop=10):
+    """
+    norm_paths: list of (path, varname) for normals, e.g. [('TE_data/M1/m1d00.mat','m1d00'), ...]
+    fault_paths: list of (path, varname) for faults (每个mode各选一个含故障数据), e.g. [('TE_data/M1/m1d04.mat','m1d04'), ...]
+    返回：X_all, seg_info（列表：[(t_norm_start,t_norm_end, t_fault_start,t_fault_end), ...]）
+    """
+    from tep_data_load import tep_data_load
+    assert len(norm_paths)==len(fault_paths)
+    X_list, segs = [], []
+    t = 0
+    for (pn, vn), (pf, vf) in zip(norm_paths, fault_paths):
+        Xn = tep_data_load(pn, vn)[:200, :]
+        Xf = tep_data_load(pf, vf)[:800, :]
+        X_list.extend([Xn, Xf])
+        segs.append((t, t+len(Xn)-1, t+len(Xn), t+len(Xn)+len(Xf)-1))
+        t += len(Xn)+len(Xf)
+    X_all = np.vstack(X_list)
+    return X_all, segs
+
+# 3) 逐时间步“全局 CL”（逐时间步口径）：用“已学习工况的正常数据”联合估计
+def compute_global_CL_per_time(combo_model, learned_normal_sets, mean, std, L=100, hop=10, alpha=0.995, device=None):
+    """
+    learned_normal_sets: list of X_normal(ndarray)，每个为“已学习工况”的正常序列（可取整段正常）
+    """
+    all_spe = []
+    for Xn in learned_normal_sets:
+        X_cnn, starts, T = make_windows(Xn, mean, std, L, hop)
+        E_win = window_time_errors(combo_model, X_cnn, device=device)
+        spe_ts, _ = overlap_avg(E_win, starts, T)
+        all_spe.append(spe_ts[L-1:])   # 避开左边界
+    cat = np.concatenate(all_spe, axis=0)
+    CL = float(np.nanquantile(cat, alpha))
+    return CL
+
+# 4) 指标（逐时间步口径，按全局CL）
+def metrics_per_time(spe_ts, CL, segs):
+    """
+    segs: [(t_norm_s,t_norm_e,t_fault_s,t_fault_e), ...]
+    """
+    T = len(spe_ts)
+    alarm = spe_ts > CL
+    # FAR/TPR（分段累计 & 全局）
+    pre_mask = np.zeros(T, dtype=bool)
+    post_mask= np.zeros(T, dtype=bool)
+    first_alarm = None
+    for (ns,ne,fs,fe) in segs:
+        pre_mask[ns:ne+1]  = True
+        post_mask[fs:fe+1] = True
+        after_idx = np.where(alarm[fs:fe+1])[0]
+        if first_alarm is None and after_idx.size>0:
+            first_alarm = fs + int(after_idx[0])
+    FAR = float((alarm & pre_mask).sum()) / max(1, pre_mask.sum())
+    TPR = float((alarm & post_mask).sum()) / max(1, post_mask.sum())
+    delay = None if first_alarm is None else int(
+        min([fs for (_,_,fs,_) in segs] + [first_alarm]) * 0 + first_alarm - segs[0][2]  # 以第一个故障起点参照
+    )
+    return dict(FAR=FAR, TPR=TPR, first_alarm=first_alarm, delay=delay, alarm=alarm)
+
+# 5) 绘图
+def plot_monitor(spe_ts, CL, segs, title, out_png):
+    T = len(spe_ts)
+    xs = np.arange(T)
+    plt.figure(figsize=(11,4))
+    plt.plot(xs, spe_ts, label='SPE (per-time)', linewidth=1.3)
+    plt.axhline(CL, linestyle='--', label='Global CL (per-time)')
+    for k,(ns,ne,fs,fe) in enumerate(segs, start=1):
+        plt.axvline(ns, color='k', linestyle=':', alpha=0.5)
+        plt.axvline(fs, color='r', linestyle=':', alpha=0.6)
+        plt.text((ns+ne)//2, np.nanmax(spe_ts)*0.05, f'M{k}-Norm', ha='center', va='bottom', fontsize=8)
+        plt.text((fs+fe)//2, np.nanmax(spe_ts)*0.10, f'M{k}-Fault', ha='center', va='bottom', fontsize=8)
+    plt.title(title); plt.xlabel('Time'); plt.ylabel('SPE (per-time)')
+    plt.legend(); plt.tight_layout(); plt.savefig(out_png, dpi=150); plt.close()
+
+# 6) 一键评估：每个会话结束后调用
+def eval_after_session(session_id, combo_model, mean, std, learned_normal_paths, learned_fault_paths,
+                       L=100, hop=10, device=None, alpha=0.995):
+    """
+    learned_normal_paths / learned_fault_paths: 只放“到当前会话为止”的工况顺序子集。
+      例如 Session-1 用 [(M1_norm)], [(M1_fault)]
+           Session-2 用 [(M1_norm,M2_norm)], [(M1_fault,M2_fault)] 以此类推
+    """
+    # ① 构造多工况测试序列（200 正常 + 800 故障）× 已学工况
+    X_test, segs = build_multi_mode_sequence(learned_normal_paths, learned_fault_paths, mean, std, L, hop)
+    # ② 逐时间步 SPE（方案B）
+    X_cnn, starts, T = make_windows(X_test, mean, std, L, hop)
+    E_win = window_time_errors(combo_model, X_cnn, device=device)
+    spe_ts, cnt = overlap_avg(E_win, starts, T)
+    # ③ 全局 CL（逐时间步口径，基于“已学工况”的正常数据集合）
+    learned_normals = []
+    for (pn, vn) in learned_normal_paths:
+        from tep_data_load import tep_data_load
+        learned_normals.append(tep_data_load(pn, vn))
+    CL = compute_global_CL_per_time(combo_model, learned_normals, mean, std, L, hop, alpha=alpha, device=device)
+    # ④ 指标
+    m = metrics_per_time(spe_ts, CL, segs)
+    # ⑤ 画图
+    plot_monitor(spe_ts, CL, segs, f'Session-{session_id} Monitoring (Per-time)', f'artifacts/monitor_S{session_id}.png')
+    return CL, m, spe_ts, segs
+
+
+
+
 def main():
+    MODE_STATS = {}  # e.g., {'M1': (mean1, std1), 'M2': (mean2, std2), ...}
+    # 已学到哪些工况就评哪些工况（逐会话递增）
+    NORMALS = [
+        ('TE_data/M1/m1d00.mat', 'm1d00'),
+        ('TE_data/M2/m2d00.mat', 'm2d00'),
+        ('TE_data/M3/m3d00.mat', 'm3d00'),
+        ('TE_data/M4/m4d00.mat', 'm4d00'),
+    ]
+    FAULTS = [
+        ('TE_data/M1/m1d04.mat', 'm1d04'),
+        ('TE_data/M2/m2d04.mat', 'm2d04'),
+        ('TE_data/M3/m3d04.mat', 'm3d04'),
+        ('TE_data/M4/m4d04.mat', 'm4d04'),
+    ]
     os.makedirs('artifacts', exist_ok=True)
 
     # =======================
@@ -160,6 +319,17 @@ def main():
     xb_M1, _ = next(iter(train_loader_M1))
     mem.add('M1', xs=xb_M1.cpu(), ys=None, k=MEM_PER_ADD)
 
+    # === 会话1结束后（只评 M1）===
+    CL_S1, metrics_S1, spe_ts_S1, segs_S1 = eval_after_session(
+        session_id=1,
+        combo_model=combo_model,
+        mean=mean, std=std,
+        learned_normal_paths=NORMALS[:1],
+        learned_fault_paths=FAULTS[:1],
+        L=L, hop=HOP, device=DEVICE, alpha=0.995
+    )
+    print("S1 Global-CL:", CL_S1, "Metrics:", metrics_S1)
+
     # =======================
     # 会话 2：M2
     # =======================
@@ -198,6 +368,19 @@ def main():
         # 4) 记忆库加入 M2 窗口样本
         xb_M2, _ = next(iter(train_loader_M2))
         mem.add('M2', xs=xb_M2.cpu(), ys=None, k=MEM_PER_ADD)
+        # === 会话2结束后（评 M1+M2）===
+        CL_S2, metrics_S2, spe_ts_S2, segs_S2 = eval_after_session(
+            session_id=2,
+            combo_model=combo_model,
+            mean=mean, std=std,
+            learned_normal_paths=NORMALS[:2],
+            learned_fault_paths=FAULTS[:2],
+            L=L, hop=HOP, device=DEVICE, alpha=0.995
+        )
+        print("S2 Global-CL:", CL_S2, "Metrics:", metrics_S2)
+
+
+
     except Exception as e:
         print("跳过 M2 会话（未找到数据或出错）：", e)
         CL_M2 = None

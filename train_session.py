@@ -16,6 +16,13 @@ def train_one_session(
     model_backbone.to(device).train()
     if decoder is not None: decoder.to(device).train()
     if clf_head is not None: clf_head.to(device).train()
+    # 将教师模型移动到目标设备，避免因设备不一致导致的 dtype 错误
+    if teacher is not None:
+        teacher = {
+            key: (module.to(device) if module is not None else None)
+            for key, module in teacher.items()
+        }
+
     params = list(model_backbone.parameters())
     if decoder is not None: params += list(decoder.parameters())
     if clf_head is not None: params += list(clf_head.parameters())
