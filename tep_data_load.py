@@ -1,14 +1,14 @@
 from scipy.io import loadmat
 import numpy as np
 
-def tep_data_load(mat_path,var_name,):
+def tep_data_load(mat_path,var_name,long=3000):
     data=loadmat(mat_path)
     X=data[var_name]
     print("原始形状：", X.shape)
     #筛选data中的变量
     cols_to_delete = [45, 49] + list(range(52, X.shape[1]))
     X_new = np.delete(X, cols_to_delete, axis=1)
-    X_new= X_new[:2000,:]
+    X_new= X_new[:long,:]
     print("删除后形状：", X_new.shape)
 
     return X_new

@@ -39,10 +39,10 @@ NORMALS = [
     ('TE_data/M4/m4d00.mat', 'm4d00'),
 ]
 FAULTS = [
-    ('TE_data/M1/m1d04.mat', 'm1d04'),
-    ('TE_data/M2/m2d04.mat', 'm2d04'),
-    ('TE_data/M3/m3d04.mat', 'm3d04'),
-    ('TE_data/M4/m4d04.mat', 'm4d04'),
+    ('TE_data/M1/m1d14.mat', 'm1d14'),
+    ('TE_data/M2/m2d14.mat', 'm2d14'),
+    ('TE_data/M3/m3d14.mat', 'm3d14'),
+    ('TE_data/M4/m4d14.mat', 'm4d14'),
 ]
 
 SEED = 0
@@ -58,7 +58,7 @@ BATCH = 32
 VAL_RATIO = 0.2
 
 # 训练参数
-EPOCHS_SESSION = 80
+EPOCHS_SESSION = 200
 LR = 1e-3
 
 # 记忆库
